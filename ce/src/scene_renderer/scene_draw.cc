@@ -25,6 +25,56 @@ using namespace internal;
 
 namespace {
 
+// 157: the ground light's half-resolution bake. The plane's light and sun
+// shadow cost the scene's most expensive fragment work (the light loop and
+// the 25-tap shadow disk); once per frame they render into this buffer at a
+// quarter of the pixels and the floor tiles sample it instead.
+unsigned int gGroundBakeFbo = 0;
+unsigned int gGroundBakeTexture = 0;
+int gGroundBakeWidth = 0;
+int gGroundBakeHeight = 0;
+
+void destroyGroundBake()
+{
+    if (gContext != nullptr) {
+        if (gGroundBakeFbo != 0) glDeleteFramebuffers(1, &gGroundBakeFbo);
+        if (gGroundBakeTexture != 0) glDeleteTextures(1, &gGroundBakeTexture);
+    }
+    gGroundBakeFbo = 0;
+    gGroundBakeTexture = 0;
+    gGroundBakeWidth = 0;
+    gGroundBakeHeight = 0;
+}
+
+bool ensureGroundBake(int width, int height)
+{
+    if (width <= 0 || height <= 0) return false;
+    if (gGroundBakeFbo != 0 && gGroundBakeWidth == width && gGroundBakeHeight == height) return true;
+    destroyGroundBake();
+    while (glGetError() != 0) {
+    }
+    glGenTextures(1, &gGroundBakeTexture);
+    glBindTexture(kTexture2D, gGroundBakeTexture);
+    glTexImage2D(kTexture2D, 0, kRgba8, width, height, 0, kRGBA, kUnsignedByte, nullptr);
+    glTexParameteri(kTexture2D, kTextureMinFilter, kLinear);
+    glTexParameteri(kTexture2D, kTextureMagFilter, kLinear);
+    glTexParameteri(kTexture2D, kTextureWrapS, kClampToEdge);
+    glTexParameteri(kTexture2D, kTextureWrapT, kClampToEdge);
+    glGenFramebuffers(1, &gGroundBakeFbo);
+    glBindFramebuffer(0x8D40 /* GL_FRAMEBUFFER */, gGroundBakeFbo);
+    glFramebufferTexture2D(0x8D40 /* GL_FRAMEBUFFER */, 0x8CE0 /* GL_COLOR_ATTACHMENT0 */, kTexture2D, gGroundBakeTexture, 0);
+    const bool complete = glGetError() == 0
+        && glCheckFramebufferStatus(0x8D40 /* GL_FRAMEBUFFER */) == 0x8CD5 /* GL_FRAMEBUFFER_COMPLETE */;
+    glBindFramebuffer(0x8D40 /* GL_FRAMEBUFFER */, 0);
+    if (!complete) {
+        destroyGroundBake();
+        return false;
+    }
+    gGroundBakeWidth = width;
+    gGroundBakeHeight = height;
+    return true;
+}
+
 void drawStaticPreview(bool withWalls, bool withHero)
 {
     if (!gInitialized || !gFloorLoaded || (withWalls && !gWallsLoaded)) return;
@@ -58,6 +108,17 @@ void drawStaticPreview(bool withWalls, bool withHero)
     glUseProgram(gSceneProgram);
     glUniform1i(gSceneCloseupFilterLocation, flying ? 1 : 0);
     bindStaticMapClipUniforms();
+    {
+        // 157 diagnostics, once per process: the MVP the scene draws with.
+        static int mvpProbes = 0;
+        if (mvpProbes++ < 2) {
+            fprintf(stderr, "probe6: mvpLoc=%d flying=%d mvp=[%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f]\n",
+                gSceneMvpLocation, flying ? 1 : 0,
+                mvp[0], mvp[1], mvp[2], mvp[3], mvp[4], mvp[5], mvp[6], mvp[7],
+                mvp[8], mvp[9], mvp[10], mvp[11], mvp[12], mvp[13], mvp[14], mvp[15]);
+            fflush(stderr);
+        }
+    }
     glUniformMatrix4fv(gSceneMvpLocation, 1, 0, mvp);
     glUniform1i(gSceneDepthAtLocation, 0);
     // The fragment shader finds a solid's line of sight by its pixel.
@@ -113,6 +174,65 @@ void drawStaticPreview(bool withWalls, bool withHero)
     glUniform1i(gSceneTextureLocation, 0);
     glBindVertexArray(gFloorVao);
     glBindTexture(kTexture2D, gFloorTexture);
+    {
+        // 157 diagnostics, once per process: the floor texture's own texel at
+        // the center of its rect, through a throwaway FBO.
+        static int texProbes = 0;
+        if (texProbes++ < 2) {
+            unsigned char texelA[4] = { 0, 0, 0, 0 };
+            unsigned char texelB[4] = { 0, 0, 0, 0 };
+            unsigned int probeFbo = 0;
+            int previousFbo = 0;
+            glGetIntegerv(0x8CA6, &previousFbo);
+            glGenFramebuffers(1, &probeFbo);
+            glBindFramebuffer(0x8D40, probeFbo);
+            glFramebufferTexture2D(0x8D40, 0x8CE0, kTexture2D, gFloorTexture, 0);
+            glReadPixels(256, 256, 1, 1, kRGBA, kUnsignedByte, texelA);
+            glReadPixels(1024, 1024, 1, 1, kRGBA, kUnsignedByte, texelB);
+            glBindFramebuffer(0x8D40, previousFbo);
+            glDeleteFramebuffers(1, &probeFbo);
+            fprintf(stderr, "probe8: floorTex (256,256)=(%d,%d,%d,%d) (1024,1024)=(%d,%d,%d,%d)\n",
+                texelA[0], texelA[1], texelA[2], texelA[3],
+                texelB[0], texelB[1], texelB[2], texelB[3]);
+            fflush(stderr);
+        }
+    }
+
+    // 157: the ground's light and sun shadow bake at a quarter of the pixel
+    // work; the tiles below sample it (uGroundBakeMode 2) instead of running
+    // the light loop and the 25-tap shadow disk per pixel. Same geometry,
+    // same uniforms, half-sized viewport with the same origin, so both passes
+    // share one normalized space.
+    const bool bakeGround = lit && shadowed && gGroundBakeWidth >= 0
+        && SDL_getenv("F2CE_NO_BAKE") == nullptr
+        && ensureGroundBake(width / 2, height / 2);
+    int unit7Texture = 0;
+    if (bakeGround) {
+        int previousFbo = 0;
+        glGetIntegerv(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &previousFbo);
+        glBindFramebuffer(0x8D40 /* GL_FRAMEBUFFER */, gGroundBakeFbo);
+        glViewport(x, y, width / 2, height / 2);
+        glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+        glClear(kColorBufferBit);
+        glDepthMask(0);
+        glUniform1i(gSceneGroundBakeModeLocation, 1);
+        glUniform1f(gSceneCutoffLocation, -1.0f);
+        glUniform1i(gSceneTexturedLocation, 1);
+        glDrawArrays(kTriangles, 6,
+            (gFloorExtensionFirst > 0 ? gFloorExtensionFirst : gFloorVertexCount) - 6);
+        glBindFramebuffer(0x8D40 /* GL_FRAMEBUFFER */, previousFbo);
+        glViewport(x, y, width, height);
+        glDepthMask(1);
+        glUniform1f(gSceneCutoffLocation, 0.01f);
+        // The bake map rides unit 7 for this frame's floor draw; the binding
+        // restores right after the tiles (the roof grid owns the unit later in
+        // the frame, and the next frame's shadow pass must not see the bake).
+        glActiveTexture(kTexture0 + 7);
+        glGetIntegerv(0x8069 /* GL_TEXTURE_BINDING_2D */, &unit7Texture);
+        glBindTexture(kTexture2D, gGroundBakeTexture);
+        glUniform1i(gSceneGroundBakeMapLocation, 7);
+        glActiveTexture(kTexture0);
+    }
 
     // Nothing lies below the floor, so it is painted first and hides nothing
     // (the donor's game view): cards and solids take the depth of their hex
@@ -130,11 +250,18 @@ void drawStaticPreview(bool withWalls, bool withHero)
     glUniform1i(gSceneTexturedLocation, 1);
     glUniform1f(gSceneCutoffLocation, 0.01f);
     glUniform1i(gSceneLightModeLocation, lit ? 1 : 0);
+    if (bakeGround) glUniform1i(gSceneGroundBakeModeLocation, 2);
     // The sea extensions sit past the tiles in the buffer; an older sidecar
     // without them ends the buffer at the tiles (the count falls back so a
     // version 6 floor.bin keeps its whole draw).
     glDrawArrays(kTriangles, 6,
         (gFloorExtensionFirst > 0 ? gFloorExtensionFirst : gFloorVertexCount) - 6);
+    if (bakeGround) {
+        glUniform1i(gSceneGroundBakeModeLocation, 0);
+        glActiveTexture(kTexture0 + 7);
+        glBindTexture(kTexture2D, unit7Texture);
+        glActiveTexture(kTexture0);
+    }
     // The sea past the map's water edges (168): flight and turned views only
     // (the game's own view stays pixel for pixel), and never cut by the clean
     // map edges, whose whole point is where the map ends - the sea goes on.
@@ -339,6 +466,21 @@ bool readBackBuffer(std::vector<unsigned char>& topDown, int drawableWidth, int 
     glPixelStorei(kPackAlignment, 1);
     glReadPixels(0, 0, drawableWidth, drawableHeight, kRGBA, kUnsignedByte, bottomUp.data());
     glPixelStorei(kPackAlignment, kDefaultPackAlignment);
+    {
+        // 157 diagnostics, once per process: what the full readback itself
+        // returned at the screen center (bottom-up rows: middle row either
+        // way) and at the HUD strip.
+        static int readProbes = 0;
+        if (readProbes++ < 2) {
+            const size_t centerRow = static_cast<size_t>(drawableHeight / 2) * rowBytes;
+            const unsigned char* c = bottomUp.data() + centerRow + static_cast<size_t>(drawableWidth / 2) * 4;
+            const unsigned char* h = bottomUp.data() + static_cast<size_t>(60) * rowBytes
+                + static_cast<size_t>(drawableWidth / 2) * 4;
+            fprintf(stderr, "probe4: readback center=(%d,%d,%d,%d) hud=(%d,%d,%d,%d)\n",
+                c[0], c[1], c[2], c[3], h[0], h[1], h[2], h[3]);
+            fflush(stderr);
+        }
+    }
     if (glGetError() != 0) {
         if (error != nullptr) *error = "OpenGL backbuffer read failed";
         return false;
@@ -478,13 +620,54 @@ bool presentStaticPreview(bool withWalls, bool withHero, bool includeOverlay,
     const bool glow = beginSceneCapture();
     drawStaticPreview(withWalls, withHero);
     if (glow) compositeGlow();
-    if (includeOverlay && withHero && gSceneOverlayReady && !staticFlyCameraActive()) {
+    {
+        // 157 diagnostics, once per process: where did the scene draw land,
+        // and what does the readback's buffer hold at the screen center.
+        static int probes = 0;
+        if (probes++ < 2) {
+            int drawFbo = 0;
+            int readFbo = 0;
+            glGetIntegerv(0x8CA6 /* GL_DRAW_FRAMEBUFFER_BINDING */, &drawFbo);
+            glGetIntegerv(0x8CD3 /* GL_READ_FRAMEBUFFER_BINDING */, &readFbo);
+            int readBuffer = 0;
+            glGetIntegerv(0x0C02 /* GL_READ_BUFFER */, &readBuffer);
+            unsigned char center[4] = { 0, 0, 0, 0 };
+            glReadPixels(drawableWidth / 2, drawableHeight / 2, 1, 1, kRGBA, kUnsignedByte, center);
+            fprintf(stderr, "probe: glow=%d drawFbo=%d readFbo=%d readBuffer=0x%x center=(%d,%d,%d,%d) noOverlayEnv=%d\n",
+                glow ? 1 : 0, drawFbo, readFbo, readBuffer,
+                center[0], center[1], center[2], center[3],
+                SDL_getenv("F2CE_CAPTURE_NO_OVERLAY") != nullptr ? 1 : 0);
+            fflush(stderr);
+        }
+    }
+    // 157 diagnostics: F2CE_CAPTURE_NO_OVERLAY strips the game overlay quad,
+    // so a capture shows the scene render alone.
+    const bool captureOverlay = includeOverlay && SDL_getenv("F2CE_CAPTURE_NO_OVERLAY") == nullptr;
+    if (captureOverlay && withHero && gSceneOverlayReady && !staticFlyCameraActive()) {
         // With what the game draws over it, as presented.
         glViewport(0, 0, drawableWidth, drawableHeight);
         glEnable(kBlend);
         glBlendFunc(1 /* GL_ONE */, kOneMinusSrcAlpha);
         drawQuad(gTextureWidth, gTextureHeight, gTextureWidth * 4, nullptr, 0, 0, gLogicalWidth, gLogicalHeight);
         glDisable(kBlend);
+        {
+            // 157 diagnostics, once per process: the same center pixel after
+            // the game overlay quad landed, plus the sharp text texture's own
+            // center pixel through a throwaway FBO.
+            static int quadProbes = 0;
+            if (quadProbes++ < 2) {
+                unsigned char center[4] = { 0, 0, 0, 0 };
+                glReadPixels(drawableWidth / 2, drawableHeight / 2, 1, 1, kRGBA, kUnsignedByte, center);
+                unsigned char sharpCenter[4] = { 0, 0, 0, 0 };
+                int previousFbo = 0;
+                glGetIntegerv(0x8CA6, &previousFbo);
+                scene_renderer::debugProbeSharpTextTexture(-1, -1, sharpCenter);
+                fprintf(stderr, "probe2: after quad center=(%d,%d,%d,%d) sharpTexCenter=(%d,%d,%d,%d) prevFbo=%d\n",
+                    center[0], center[1], center[2], center[3],
+                    sharpCenter[0], sharpCenter[1], sharpCenter[2], sharpCenter[3], previousFbo);
+                fflush(stderr);
+            }
+        }
         const PreparedSharpTextFrame& text = preparedSharpTextFrame();
         if (text.active) {
             const bool uploaded = uploadSharpTextOverlay(text.overlay.pixels.data(), text.overlay.width,
@@ -504,6 +687,23 @@ bool presentStaticPreview(bool withWalls, bool withHero, bool includeOverlay,
                     drawSceneOverlay(fallback.data(), text.width, text.height, text.rgbaPitch);
                 }
             }
+        }
+    }
+    {
+        // 157 diagnostics, once per process: a vertical slice of the buffer
+        // at the screen's horizontal center, right before the readback.
+        static int finalProbes = 0;
+        if (finalProbes++ < 2) {
+            fprintf(stderr, "probe3: slice glY:");
+            for (int slice = 0; slice < 15; slice++) {
+                const int sliceY = slice * drawableHeight / 14;
+                if (sliceY >= drawableHeight) continue;
+                unsigned char sample[4] = { 0, 0, 0, 0 };
+                glReadPixels(drawableWidth / 2, sliceY, 1, 1, kRGBA, kUnsignedByte, sample);
+                fprintf(stderr, " y%d=(%d,%d,%d)", sliceY, sample[0], sample[1], sample[2]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
         }
     }
     if (glGetError() != 0) return fail(withWalls
